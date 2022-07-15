@@ -72,7 +72,6 @@ jobs:
           tox -e py
 
   test-endpoint:
-    runs-on: ubuntu-latest
     services:
       rabbitmq:
         image: rabbitmq
@@ -82,8 +81,10 @@ jobs:
         options: --health-cmd "rabbitmqctl node_health_check" --health-interval 10s --health-timeout 5s --health-retries 5
     strategy:
       matrix:
-        python-version: ["3.7", "3.10"]
+        os: [ubuntu-latest]
+        python-version: ["3.7", "3.8", "3.9", "3.10"]
     name: "Test Endpoint on py${{ matrix.python-version }} x ${{ matrix.os }} "
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-python@v1
@@ -110,7 +111,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.7", "3.8", "3.9"]
+        python: ["3.7", "3.8", "3.9", "3.10"]
     steps:
     - uses: actions/checkout@master
     - name: Extract tag name
