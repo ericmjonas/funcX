@@ -177,9 +177,9 @@ class WebSocketPollingTask:
                     # This is not an expected case.  If upstream does not return a
                     # task_id, then we have a larger error in play.  Time to shut down
                     # (annoy the user!) and field the requisite bug reports.
+                    upstream_error = data.get("exception", "(no reason given!)")
                     errmsg = (
-                        f"Upstream error: {data.get('exception', '(no reason given!)')}"
-                        f"\nShutting down connection."
+                        f"Upstream error: {upstream_error}\nShutting down connection."
                     )
                     log.error(errmsg)
                     for fut in pending_futures.values():
