@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent
+import json
 import logging
 import queue
 import threading
 import time
 import typing as t
 
+from funcx.errors import FuncxTaskExecutionFailed
 from funcx.sdk.asynchronous.funcx_future import FuncXFuture
 from funcx.sdk.asynchronous.ws_polling_task import WebSocketPollingTask
 from funcx.sdk.client import FuncXClient
@@ -118,16 +120,11 @@ class FuncXExecutor(concurrent.futures.Executor):
         self._counter_future_map: t.Dict[int, FuncXFuture] = {}
         self._future_counter: int = 0
         self._function_registry: t.Dict[t.Any, str] = {}
-        self._function_future_map: t.Dict[str, FuncXFuture] = {}
         self._kill_event: t.Optional[threading.Event] = None
         self._task_submit_thread: t.Optional[threading.Thread] = None
 
-        self.poller_thread = ExecutorPollerThread(
-            self.funcx_client,
-            self._function_future_map,
-        )
-
-        self._reset_poller()
+        self.poller_thread = ExecutorPollerThread(self.funcx_client.init_kwargs)
+        self.poller_thread.start()
 
         if self.batch_enabled:
             log.info("Batch submission enabled.")
@@ -136,16 +133,16 @@ class FuncXExecutor(concurrent.futures.Executor):
         atexit.register(self.shutdown)
 
     def _reset_poller(self):
-        if self.poller_thread.is_running:
+        if self.poller_thread.is_alive():
             self.poller_thread.shutdown()
-        self.poller_thread.atomic_controller.reset()
+        self.poller_thread = ExecutorPollerThread(self.funcx_client.init_kwargs)
+        self.poller_thread.start()
 
         self._future_counter = 0
-        for fut_map in (self._counter_future_map, self._function_future_map):
-            while fut_map:
-                _, fut = fut_map.popitem()
-                if not fut.done():
-                    fut.cancel()
+        while self._counter_future_map:
+            _, fut = self._counter_future_map.popitem()
+            if not fut.done():
+                fut.cancel()
 
     @property
     def results_ws_uri(self) -> str:
@@ -165,7 +162,7 @@ class FuncXExecutor(concurrent.futures.Executor):
         )
         self._task_submit_thread.daemon = True
         self._task_submit_thread.start()
-        log.info("Started task submit thread")
+        log.debug("Started task submit thread")
 
     def register_function(self, func: t.Callable, container_uuid=None):
         # Please note that this is a partial implementation, not all function
@@ -214,8 +211,8 @@ class FuncXExecutor(concurrent.futures.Executor):
 
         assert endpoint_id is not None, "endpoint_id key-word argument must be set"
 
-        msg = TaskSubmissionInfo(
-            future_id=future_id,
+        task = TaskSubmissionInfo(
+            future_id=future_id,  # an integer; because we don't yet know the task id
             function_id=self._function_registry[function],
             endpoint_id=endpoint_id,
             args=args,
@@ -226,11 +223,9 @@ class FuncXExecutor(concurrent.futures.Executor):
         self._counter_future_map[future_id] = fut
 
         if self.batch_enabled:
-            # Put task to the outgoing queue
-            self.task_outgoing.put(msg)
+            self.task_outgoing.put(task)
         else:
-            # self._submit_task takes a list of messages
-            self._submit_tasks([msg])
+            self._submit_tasks([task])
 
         return fut
 
@@ -267,30 +262,29 @@ class FuncXExecutor(concurrent.futures.Executor):
 
         log.info("Exiting")
 
-    def _submit_tasks(self, messages: t.List[TaskSubmissionInfo]):
+    def _submit_tasks(self, tasks: t.List[TaskSubmissionInfo]):
         """Submit a batch of tasks"""
         batch = self.funcx_client.create_batch(task_group_id=self.task_group_id)
-        for msg in messages:
+        for task in tasks:
             batch.add(
-                *msg.args,
-                **msg.kwargs,
-                endpoint_id=msg.endpoint_id,
-                function_id=msg.function_id,
+                *task.args,
+                **task.kwargs,
+                endpoint_id=task.endpoint_id,
+                function_id=task.function_id,
             )
-            log.debug(f"Adding msg {msg} to funcX batch")
+            log.debug("Adding task to funcX batch: %s", task)
         try:
             batch_tasks = self.funcx_client.batch_run(batch)
             log.debug(f"Batch submitted to task_group: {self.task_group_id}")
         except Exception:
-            log.error(f"Error submitting {len(messages)} tasks to funcX")
+            log.error(f"Error submitting {len(tasks)} tasks to funcX")
             raise
         else:
-            for i, msg in enumerate(messages):
+            for i, msg in enumerate(tasks):
                 task_uuid: str = batch_tasks[i]
                 fut = self._counter_future_map.pop(msg.future_id)
                 fut.task_id = task_uuid
-                self._function_future_map[task_uuid] = fut
-            self.poller_thread.atomic_controller.increment(val=len(messages))
+                self.poller_thread.watch_for_task(fut)
 
     def reload_tasks(self) -> t.Iterable[FuncXFuture]:
         """
@@ -373,7 +367,7 @@ class FuncXExecutor(concurrent.futures.Executor):
         Any previous futures received from this executor will be cancelled.
         """
 
-        # step 1: cleanup!  Turn off poller_thread, clear _function_future_map
+        # step 1: cleanup!
         self._reset_poller()
 
         # step 2: from server, acquire list of related task ids and make futures
@@ -391,16 +385,13 @@ class FuncXExecutor(concurrent.futures.Executor):
         for task in r.get("tasks", []):
             task_uuid: str = task["id"]
             fut = FuncXFuture(task_uuid)
-            self._function_future_map[task_uuid] = fut
+            self.poller_thread.watch_for_task(fut)
             futures.append(fut)
 
         if not futures:
             log.warning(f"Received no tasks for Task Group ID: {self.task_group_id}")
 
-        # step 4: start up polling!
-        self.poller_thread.atomic_controller.increment(val=len(futures))
-
-        # step 5: the goods for the consumer
+        # step 4: the goods for the consumer
         return futures
 
     def shutdown(self):
@@ -408,7 +399,7 @@ class FuncXExecutor(concurrent.futures.Executor):
             self._kill_event.set()  # Reminder: stops the batch submission thread
             self.task_outgoing.put(None)
 
-        self._reset_poller()
+        self.poller_thread.shutdown()
 
         log.debug(f"Executor:{self.label} shutting down")
 
@@ -417,17 +408,13 @@ def noop():
     return
 
 
-class ExecutorPollerThread:
+class ExecutorPollerThread(threading.Thread):
     """This encapsulates the creation of the thread on which event loop lives,
     the instantiation of the WebSocketPollingTask onto the event loop and the
     synchronization primitives used (AtomicController)
     """
 
-    def __init__(
-        self,
-        funcx_client: FuncXClient,
-        function_future_map: t.Dict[str, FuncXFuture],
-    ):
+    def __init__(self, funcx_client_kwargs: dict[str, t.Any]):
         """
         Parameters
         ==========
@@ -440,68 +427,189 @@ class ExecutorPollerThread:
             when the upstream websocket service sends updates
         """
 
-        self.funcx_client: FuncXClient = funcx_client
-        self._function_future_map: t.Dict[str, FuncXFuture] = function_future_map
-        self.eventloop = asyncio.new_event_loop()
-        self.atomic_controller = AtomicController(self._start, noop)
-        self.ws_handler = WebSocketPollingTask(
-            self.funcx_client,
-            self.eventloop,
-            atomic_controller=self.atomic_controller,
-            init_task_group_id=self.task_group_id,
-            results_ws_uri=self.results_ws_uri,
-            auto_start=False,
-        )
-        self._thread: t.Optional[threading.Thread] = None
+        super().__init__()
+        self.funcx_client_kwargs = funcx_client_kwargs  # Thread safety; recreate
+        self._thread_id = threading.get_ident()
+        self._time_to_stop = False
 
-    @property
-    def results_ws_uri(self) -> str:
-        return self.funcx_client.results_ws_uri
+        self._ws_task: WebSocketPollingTask | None = None
+        self._eventloop: asyncio.AbstractEventLoop | None = None
 
-    @property
-    def task_group_id(self) -> str:
-        return self.funcx_client.session_task_group_id
+        # Results that the user expects to receive from the server
+        self._pending_results: dict[str, FuncXFuture] = {}
 
-    @property
-    def is_running(self) -> bool:
-        return self.eventloop.is_running()
+        # Results received from the server.  The keys correlate with the
+        # _pending_results dict's keys
+        self._received_results: dict[str, dict] = {}
 
-    def _start(self):
-        """Start the result polling thread"""
-        # Currently we need to put the batch id's we launch into this queue
-        # to tell the web_socket_poller to listen on them. Later we'll associate
+        # A flag to indicate that useful work is ready; the processor clears
+        # this event, and new results set it (e.g., `.watch_for_task()`)
+        self._data_arrived: asyncio.Event | None = None
 
-        self.ws_handler.closed_by_main_thread = False
-        self._thread = threading.Thread(
-            target=self.event_loop_thread, daemon=True, name="FuncX-Poller-Thread"
-        )
-        self._thread.start()
-        log.debug("Started web_socket_poller thread")
+    def start(self) -> None:
+        if self.is_alive():
+            return
+        super().start()
 
-    def event_loop_thread(self):
-        asyncio.set_event_loop(self.eventloop)
-        self.eventloop.run_until_complete(self.web_socket_poller())
+    async def _has_new_items(self, timeout=1) -> bool:
+        """
+        Internal convenience method: wait up to timeout seconds to determine if
+        there are new items to process.
+        """
+        try:
+            return await asyncio.wait_for(self._data_arrived.wait(), timeout=timeout)
+        except asyncio.exceptions.TimeoutError:
+            pass
+        return False
 
-    async def web_socket_poller(self):
+    def run(self) -> None:
+        self._time_to_stop = False
+        self._thread_id = threading.get_ident()
+        self._eventloop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._eventloop)
+        self._data_arrived = asyncio.Event()
+        funcx_client = FuncXClient(**self.funcx_client_kwargs)
+
+        async def _kernel():
+            self._ws_task = WebSocketPollingTask(
+                funcx_client,
+                asyncio.get_running_loop(),
+                init_task_group_id=funcx_client.session_task_group_id,
+                results_ws_uri=funcx_client.results_ws_uri,
+                auto_start=False,
+            )
+
+            result_queue = asyncio.Queue()
+            deserializer = funcx_client.fx_serializer.deserialize
+            res_handler = asyncio.create_task(self._result_handler(result_queue))
+            res_finisher = asyncio.create_task(self._result_finisher(deserializer))
+
+            while not self._time_to_stop:
+                if not await self._has_new_items():
+                    continue
+
+                await self._web_socket_poller(result_queue)
+
+            self._time_to_stop = True
+            self._ws_task.closed_by_main_thread = True
+
+            await self._ws_task.close()
+            res_handler.cancel()
+            res_finisher.cancel()
+
+        self._eventloop.run_until_complete(_kernel())
+
+    def watch_for_task(self, task_fut: FuncXFuture):
+        if self._time_to_stop:
+            raise RuntimeError("Request to watch task but poller thread is stopped.")
+
+        self._pending_results[task_fut.task_id] = task_fut
+        if self.is_alive():
+            self._eventloop.call_soon(self._data_arrived.set)
+        else:
+            log.warning(
+                "Added result future, but Poller thread is not active (%s)",
+                task_fut.task_id,
+            )
+
+    async def _web_socket_poller(self, result_queue: asyncio.Queue):
         """Start ws and listen for tasks.
         If a remote disconnect breaks the ws, close the ws and reconnect"""
-        time_to_disconnect = False
-        while not time_to_disconnect:
-            await self.ws_handler.init_ws(start_message_handlers=False)
-            time_to_disconnect = await self.ws_handler.handle_incoming(
-                self._function_future_map, auto_close=True
-            )
-            if not time_to_disconnect:
-                # handle_incoming broke from a remote side disconnect
-                # we should close and re-connect
-                log.info("Attempting ws close")
-                await self.ws_handler.close()
-                log.info("Attempting ws re-connect")
+        assert self._ws_task is not None  # created by the thread
+
+        # Step 1: Loop until it's time to stop
+        while not self._time_to_stop:
+            log.debug("Connecting to websocket.")
+            # Step 2: Tell the websocket server what queue we want to watch
+            await self._ws_task.init_ws(start_message_handlers=False)
+
+            # Step 3: Put incoming results into result_queue
+            recv = asyncio.create_task(self._ws_task.recv_incoming(result_queue))
+            self._time_to_stop = await recv  # remote-side disconnect?  Then loop again
+
+            log.debug("Attempting to close websocket.")
+            await self._ws_task.close()
+
+    async def _result_handler(self, result_queue: asyncio.Queue):
+        pending_futures = self._pending_results
+        while not self._time_to_stop:
+            try:
+                res = await asyncio.wait_for(result_queue.get(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                data = json.loads(res)
+            except json.JSONDecodeError as exc:
+                log.error(f"Unable to parse result message: {exc}")
+                continue
+
+            task_id = data.get("task_id")
+            if task_id:
+                self._received_results[task_id] = data
+                self._data_arrived.set()
+            else:
+                # This is not an expected case.  If upstream does not return a
+                # task_id, then we have a larger error in play.  Time to shut down
+                # (annoy the user!) and field the requisite bug reports.
+                upstream_error = data.get("exception", "(no reason given!)")
+                errmsg = f"Upstream error: {upstream_error}\nShutting down connection."
+                log.error(errmsg)
+                self._time_to_stop = True
+                for fut in pending_futures.values():
+                    if not fut.done():
+                        fut.cancel()
+                return
+
+    async def _result_finisher(self, deserializer: t.Callable):
+        pending_results = self._pending_results
+        received_results = self._received_results
+        while not self._time_to_stop:
+            if not await self._has_new_items():
+                continue
+            self._data_arrived.clear()
+
+            completed_task_ids = pending_results.keys() & received_results.keys()
+            for task_id in completed_task_ids:
+                task_fut = pending_results.pop(task_id)
+                data = received_results.pop(task_id)
+
+                try:
+                    status = str(data.get("status")).lower()
+                    if status == "success" and "result" in data:
+                        task_fut.set_result(deserializer(data["result"]))
+                    elif "exception" in data:
+                        task_fut.set_exception(
+                            FuncxTaskExecutionFailed(
+                                data["exception"], data["completion_t"]
+                            )
+                        )
+                    else:
+                        msg = f"Data contained neither result nor exception: {data}"
+                        task_fut.set_exception(Exception(msg))
+                except Exception as exc:
+                    task_exc = Exception(
+                        f"Malformed or unexpected data structure.  Task data: {data}",
+                    )
+                    task_exc.__cause__ = exc
+                    task_fut.set_exception(task_exc)
+
+                continue
 
     def shutdown(self):
-        if self.is_running:
-            self.ws_handler.closed_by_main_thread = True
-            asyncio.run_coroutine_threadsafe(
-                self.ws_handler.close(), self.eventloop
-            ).result()
-            self.eventloop.stop()
+        """
+        Shut down the thread and cancel any outstanding result futures.
+
+        N.B. joins the thread, and so _must_ be called by the parent process
+        """
+        self._time_to_stop = True
+        if self.is_alive():
+            if self._ws_task:
+                self._ws_task.closed_by_main_thread = True
+
+        while self._pending_results:
+            _, fut = self._pending_results.popitem()
+            if not fut.done():
+                fut.cancel()
+
+        self.join(timeout=5)

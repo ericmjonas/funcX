@@ -185,6 +185,25 @@ class FuncXClient:
         # TODO: remove this
         self._searcher = None
 
+        # Convenience for recreating
+        self.init_kwargs = {
+            "http_timeout": http_timeout,
+            "funcx_home": funcx_home,
+            "asynchronous": asynchronous,
+            "loop": loop,
+            "environment": environment,
+            "funcx_service_address": funcx_service_address,
+            "results_ws_uri": results_ws_uri,
+            "warn_about_url_mismatch": warn_about_url_mismatch,
+            "task_group_id": self.session_task_group_id,
+            "do_version_check": do_version_check,
+            "openid_authorizer": openid_authorizer,
+            "search_authorizer": search_authorizer,
+            "fx_authorizer": fx_authorizer,
+            "login_manager": login_manager,
+            **kwargs,
+        }
+
     @property
     def searcher(self):
         # TODO: remove this
