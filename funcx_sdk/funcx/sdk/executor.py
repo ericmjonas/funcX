@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import typing as t
+from asyncio import QueueEmpty
 
 from funcx.errors import FuncxTaskExecutionFailed
 from funcx.sdk.asynchronous.funcx_future import FuncXFuture
@@ -82,7 +83,7 @@ class AtomicController:
         return f"AtomicController value:{self._value}"
 
 
-class FuncXExecutor(concurrent.futures.Executor):
+class FuncXExecutor2(concurrent.futures.Executor):
     """Extends the concurrent.futures.Executor class to layer this interface
     over funcX. The executor returns future objects that are asynchronously
     updated with results by the WebSocketPollingTask using a websockets connection
@@ -614,3 +615,360 @@ class ExecutorPollerThread(threading.Thread):
                 fut.cancel()
 
         self.join(timeout=5)
+
+
+class FuncXExecutor(concurrent.futures.Executor):
+    def __init__(
+        self,
+        endpoint_id: str,
+        container_id: str | None = None,
+        batch_size: int = 512,
+        label: str = "FuncXExecutor",
+        function_registry: dict | None = None,
+        funcx_client_kwargs: dict | None = None,
+    ):
+        self.endpoint_id = endpoint_id
+        self.batch_size = batch_size
+        self.label = label
+        self.container_id = container_id
+        self._function_registry = function_registry or {}
+        self._funcx_client_kwargs = funcx_client_kwargs or {}
+        self._funcx_client: FuncXClient | None = None
+
+        # Results that the user expects to receive from the server
+        self._pending_results: dict[str, FuncXFuture] = {}
+
+        # Results received from the server.  The keys correlate with the
+        # _pending_results dict's keys
+        self._received_results: dict[str, dict] = {}
+
+        # A flag to indicate that useful work is ready; the processor clears
+        # this event, and new results set it (e.g., `.watch_for_task()`)
+        self._check_results: asyncio.Event | None = None
+
+        self.task_count_submitted = 0
+        self._to_submit: asyncio.Queue | None = None
+        self._tasks_to_send: asyncio.Queue[
+            tuple[FuncXFuture, TaskSubmissionInfo]
+        ] | None = None
+
+        self._task_loop: asyncio.AbstractEventLoop | None = None
+        self._network_loop: asyncio.AbstractEventLoop | None = None
+
+        threading.Thread(target=self._network_thread_impl, daemon=True).start()
+        threading.Thread(target=self._async_thread_impl, daemon=True).start()
+
+        while not (self._network_loop and self._network_loop.is_running()):
+            log.debug("Waiting for network loop to initialize ...")
+            time.sleep(0.5)
+        while not (self._task_loop and self._task_loop.is_running()):
+            log.debug("Waiting for task loop to initialize ...")
+            time.sleep(0.5)
+
+    @property
+    def task_group_id(self) -> str:
+        assert self._funcx_client is not None
+        return self._funcx_client.session_task_group_id
+
+    @task_group_id.setter
+    def task_group_id(self, val) -> None:
+        assert self._funcx_client is not None
+        self._funcx_client.session_task_group_id = val
+
+    def submit(self, fn: t.Callable, *args, **kwargs) -> FuncXFuture:
+        f = FuncXFuture()
+
+        def enqueue_it():
+            self._to_submit.put_nowait((f, fn, args, kwargs))
+        self._task_loop.call_soon_threadsafe(enqueue_it)
+        return f
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1) -> t.Iterator:
+        pass
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        self._task_loop.stop()
+        self._network_loop.stop()
+        self._task_loop = None
+        self._network_loop = None
+
+    def _network_thread_impl(self) -> None:
+        self._network_thread_id = threading.get_ident()
+        self._network_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._network_loop)
+
+        log.debug("Creating FuncXClient")
+        self._funcx_client = FuncXClient(**self._funcx_client_kwargs)
+        debug_args = self.label, self._network_thread_id
+        log.debug(
+            "FuncXClient instantiated for executor (%s, thread: %s) - %s",
+            *debug_args,
+            self._funcx_client_kwargs
+        )
+
+        self._network_loop.run_forever()
+        log.debug("Network loop ending (%s, thread: %s)", *debug_args)
+
+    def _network_thread_check(self) -> None:
+        if self._network_thread_id != threading.get_ident():
+            raise RuntimeError(
+                "Called from wrong thread.  The network thread is "
+                f"{self._network_thread_id} while this thread is "
+                f"{threading.get_ident()}")
+
+    def _network_register_function(self, fut: asyncio.Future[str], func: t.Callable):
+        self._network_thread_check()
+
+        try:
+            function_id = self._funcx_client.register_function(
+                func,
+                function_name=func.__name__,
+                container_uuid=self.container_id,
+            )
+            log.debug(
+                "Network thread - function registered: %s -> %s",
+                func.__name__,
+                function_id
+            )
+
+            def _set():
+                fut.set_result(function_id)
+        except Exception as exc:
+            def _set():
+                fut.set_exception(exc)
+        fut.get_loop().call_soon_threadsafe(_set)
+
+    def _network_submit_tasks(
+        self,
+        fut: asyncio.Future[list[str]],
+        tasks: t.Iterable[TaskSubmissionInfo]
+    ):
+        self._network_thread_check()
+
+        batch = self._funcx_client.create_batch(task_group_id=self.task_group_id)
+        for task in tasks:
+            batch.add(
+                *task.args,
+                **task.kwargs,
+                endpoint_id=task.endpoint_id,
+                function_id=task.function_id,
+            )
+            log.debug(f"Task added to funcX batch: %s", task)
+        try:
+            task_ids = self._funcx_client.batch_run(batch)
+            log.debug("Batch submitted to task_group: %s", self.task_group_id)
+            self.task_count_submitted += len(task_ids)
+
+            def _set():
+                fut.set_result(task_ids)
+        except Exception as exc:
+            def _set():
+                fut.set_exception(exc)
+        fut.get_loop().call_soon_threadsafe(_set)
+
+    def _async_thread_impl(self) -> None:
+        self._task_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._task_loop)
+
+        self._to_submit = asyncio.Queue()
+        self._tasks_to_send = asyncio.Queue()
+        self._check_results = asyncio.Event()
+
+        # Cheeky and "not safe" generally, but okay for the time being because
+        # the websocket polling task (currently) uses only thread-safe items.
+        # We'll need to address this if that changes.
+        while not self._funcx_client:
+            time.sleep(0.01)
+
+        self._ws_task = WebSocketPollingTask(
+            self._funcx_client,
+            self._task_loop,
+            init_task_group_id=self.task_group_id,
+            results_ws_uri=self._funcx_client.results_ws_uri,
+            auto_start=False,
+        )
+
+        result_queue = asyncio.Queue()
+        deserializer = self._funcx_client.fx_serializer.deserialize
+        self._task_loop.create_task(self._prepare_tasks())
+        self._task_loop.create_task(self._send_tasks_upstream())
+        self._task_loop.create_task(self._web_socket_poller(result_queue))
+        self._task_loop.create_task(self._result_handler(result_queue))
+        self._task_loop.create_task(self._result_finisher(deserializer))
+
+        self._task_loop.run_forever()
+        log.debug("Executor thread ends (%s - %s)", self.label, threading.get_ident())
+
+    async def _prepare_tasks(self):
+        log.debug(
+            "FuncXExecutor _prepare_tasks begins (%s, thread: %s)",
+            self.label,
+            threading.get_ident()
+        )
+        task_counter = 0
+        while True:
+            fut, fn, args, kwargs = await self._to_submit.get()
+            if fn not in self._function_registry:
+                log.debug("Registering new function: %s", fn.__name__)
+                await self._register_function(fn)
+
+            task_counter += 1
+            task = TaskSubmissionInfo(
+                future_id=task_counter,  # Unused anymore; useful for debug?
+                function_id=self._function_registry[fn],
+                endpoint_id=self.endpoint_id,
+                args=args,
+                kwargs=kwargs,
+            )
+            await self._tasks_to_send.put((fut, task))
+
+            self._to_submit.task_done()
+
+    async def _register_function(self, func: t.Callable):
+        # Note that this is a partial implementation; not all function
+        # registration options are fleshed out here.
+        f: asyncio.Future[str] = self._task_loop.create_future()
+        self._network_loop.call_soon_threadsafe(
+            self._network_register_function, f, func
+        )
+        await f
+
+        try:
+            function_id = f.result()
+            self._function_registry[func] = function_id
+            log.debug("Registered function; ID: %s", function_id)
+        except Exception as exc:
+            log.error(f"Failed to register {func.__name__}.  (Exception: {exc})")
+            raise
+
+    async def _send_tasks_upstream(self) -> None:
+        log.debug(
+            "FuncXExecutor _send_tasks_upstream begins (%s, thread: %s)",
+            self.label,
+            threading.get_ident()
+        )
+        while True:
+            fut, task = await self._tasks_to_send.get()
+            futs: list[FuncXFuture] = [fut]
+            tasks: list[TaskSubmissionInfo] = [task]
+            while len(tasks) < self.batch_size:
+                try:
+                    fut, task = self._tasks_to_send.get_nowait()
+                    futs.append(fut)
+                    tasks.append(task)
+                except QueueEmpty:
+                    break
+
+            f: asyncio.Future[list[str]] = self._task_loop.create_future()
+            self._network_loop.call_soon_threadsafe(
+                self._network_submit_tasks, f, tasks
+            )
+            await f
+            try:
+                task_ids = f.result()
+            except Exception as exc:
+                log.error(f"Failed to submit tasks to funcX.  Exception: {exc}")
+                raise
+
+            for fut, task, task_uuid in zip(futs, tasks, task_ids):
+                fut.task_id = task_uuid
+                self._pending_results[task_uuid] = fut
+
+            self._check_results.set()
+            del futs, tasks
+
+    async def _web_socket_poller(self, result_queue: asyncio.Queue):
+        """Start ws and listen for tasks.
+        If a remote disconnect breaks the ws, close the ws and reconnect"""
+        assert self._ws_task is not None  # created by the thread
+
+        log.debug(
+            "FuncXExecutor _web_socket_poller begins (%s, thread: %s)",
+            self.label,
+            threading.get_ident()
+        )
+        # Step 1: Loop until it's time to stop
+        while True:
+            await self._check_results.wait()
+
+            log.debug("Connecting to websocket.")
+            # Step 2: Tell the websocket server what queue we want to watch
+            await self._ws_task.init_ws(start_message_handlers=False)
+
+            # Step 3: Put incoming results into result_queue
+            await asyncio.create_task(self._ws_task.recv_incoming(result_queue))
+
+            log.debug("Attempting to close websocket.")
+            await self._ws_task.close()
+
+    async def _result_handler(self, result_queue: asyncio.Queue):
+        log.debug(
+            "FuncXExecutor _result_handler begins (%s, thread: %s)",
+            self.label,
+            threading.get_ident()
+        )
+        pending_futures = self._pending_results
+        while True:
+            res = await result_queue.get()
+
+            try:
+                data = json.loads(res)
+            except json.JSONDecodeError as exc:
+                log.error(f"Unable to parse result message: {exc}")
+                continue
+
+            task_id = data.get("task_id")
+            if task_id:
+                self._received_results[task_id] = data
+                self._check_results.set()
+            else:
+                # This is not an expected case.  If upstream does not return a
+                # task_id, then we have a larger error in play.  Time to shut down
+                # (annoy the user!) and field the requisite bug reports.
+                upstream_error = data.get("exception", "(no reason given!)")
+                errmsg = f"Upstream error: {upstream_error}\nShutting down connection."
+                log.error(errmsg)
+                for fut in pending_futures.values():
+                    if not fut.done():
+                        fut.cancel()
+                self.shutdown()
+                return
+
+    async def _result_finisher(self, deserializer: t.Callable):
+        log.debug(
+            "FuncXExecutor _result_finisher begins (%s, thread: %s)",
+            self.label,
+            threading.get_ident()
+        )
+        pending_results = self._pending_results
+        received_results = self._received_results
+        while True:
+            await self._check_results.wait()
+            self._check_results.clear()
+
+            completed_task_ids = pending_results.keys() & received_results.keys()
+            for task_id in completed_task_ids:
+                task_fut = pending_results.pop(task_id)
+                data = received_results.pop(task_id)
+
+                try:
+                    status = str(data.get("status")).lower()
+                    if status == "success" and "result" in data:
+                        task_fut.set_result(deserializer(data["result"]))
+                    elif "exception" in data:
+                        task_fut.set_exception(
+                            FuncxTaskExecutionFailed(
+                                data["exception"], data["completion_t"]
+                            )
+                        )
+                    else:
+                        msg = f"Data contained neither result nor exception: {data}"
+                        task_fut.set_exception(Exception(msg))
+                except Exception as exc:
+                    task_exc = Exception(
+                        f"Malformed or unexpected data structure.  Task data: {data}",
+                    )
+                    task_exc.__cause__ = exc
+                    task_fut.set_exception(task_exc)
+
+                continue
