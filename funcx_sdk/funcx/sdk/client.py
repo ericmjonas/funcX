@@ -8,12 +8,9 @@ import typing as t
 import uuid
 import warnings
 
-from funcx.errors import (
-    FuncxTaskExecutionFailed,
-    SerializationError,
-    TaskPending,
-    handle_response_errors,
-)
+from globus_sdk.exc.api import GlobusAPIError
+
+from funcx.errors import FuncxTaskExecutionFailed, SerializationError, TaskPending
 from funcx.sdk._environments import (
     get_web_service_url,
     get_web_socket_url,
@@ -440,11 +437,14 @@ class FuncXClient:
         for result in r["results"]:
             task_id = result["task_uuid"]
             task_uuids.append(task_id)
-            if result["http_status_code"] != 200:
+            if result["http_status_code"] >= 400:
                 # this method of handling errors for a batch response is not
                 # ideal, as it will raise any error in the multi-response,
                 # but it will do until batch_run is deprecated in favor of Executer
-                handle_response_errors(result)
+
+                # Checking for 'Failed' is how FuncxResponseError.unpack
+                # originally checked for errors.  >=400 might be more generic
+                raise GlobusAPIError(result)
 
         if self.asynchronous:
             task_group_id = r["task_group_id"]
