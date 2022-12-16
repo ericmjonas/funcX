@@ -1,0 +1,6 @@
+New Functionality
+^^^^^^^^^^^^^^^^^
+
+- The validity of a user's refresh token will be verified before performing an
+  action that requires authentication. If a token is found to be invalid, a new
+  auth flow will automatically be initiated.
