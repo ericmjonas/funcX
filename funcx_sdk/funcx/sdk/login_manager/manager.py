@@ -56,10 +56,14 @@ class LoginManager:
       authorizers
     """
 
+    FUNCX_RS = FuncxScopes.resource_server
+    AUTH_RS = AuthScopes.resource_server
+    SEARCH_RS = SearchScopes.resource_server
+
     SCOPES: dict[str, list[str]] = {
-        FuncxScopes.resource_server: [FuncxScopes.all],
-        AuthScopes.resource_server: [AuthScopes.openid],
-        SearchScopes.resource_server: [SearchScopes.all],
+        FUNCX_RS: [FuncxScopes.all],
+        AUTH_RS: [AuthScopes.openid],
+        SEARCH_RS: [SearchScopes.all],
     }
 
     def __init__(self, *, environment: str | None = None) -> None:
@@ -122,16 +126,32 @@ class LoginManager:
         return tokens_revoked
 
     def ensure_logged_in(self) -> None:
-        with self._access_lock:
-            data = self._token_storage.get_by_resource_server()
-        needs_login = False
         for rs_name, _rs_scopes in self.login_requirements:
-            if rs_name not in data:
-                needs_login = True
-                break
+            if not self.has_login(rs_name):
+                self.run_login_flow()
 
-        if needs_login:
-            self.run_login_flow()
+    def _validate_token(self, token: str) -> bool:
+        auth_client = internal_auth_client()
+        try:
+            res = auth_client.oauth2_validate_token(token)
+        except globus_sdk.AuthAPIError:
+            return False
+        return bool(res["active"])
+
+    def has_login(self, resource_server: str):
+        """
+        Determines if the user has a valid refresh token for the given
+        resource server
+        """
+        # Client identities are always logged in
+        if is_client_login():
+            return True
+
+        tokens = self._token_storage.get_token_data(resource_server)
+        if tokens is None or "refresh_token" not in tokens:
+            return False
+        rt = tokens["refresh_token"]
+        return self._validate_token(rt)
 
     def _get_authorizer(
         self, resource_server: str
